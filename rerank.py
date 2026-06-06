@@ -1,40 +1,51 @@
 """Module 8 — Thursday Stretch (Honors Track): Cross-Encoder Re-Ranking.
 
-Add a cross-encoder re-ranking stage to the lab's hybrid retriever and
-evaluate the cost/benefit. Cross-encoders score (query, passage) pairs
-jointly rather than independently — they produce a more discriminative
-ranking, but at a real latency cost.
-
-Use cross-encoder/ms-marco-MiniLM-L-6-v2 from sentence-transformers.
+Implement a two-stage retrieval pipeline:
+1. Candidate generation: Hybrid search (BM25 + Dense) to get top-k_in results.
+2. Re-ranking: Cross-encoder to score (query, candidate) pairs and return top-k_out.
 """
 
 from __future__ import annotations
 
 import weaviate
+from sentence_transformers import CrossEncoder
 
-from retrieval_helpers import hybrid_search
-
-CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# The Cross-Encoder model specified in the assignment
+# Initializing at module scope to avoid re-loading per call
+_CE_MODEL = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 
 def cross_encoder_rerank(query: str, candidates: list[dict], k_out: int = 5) -> list[str]:
-    """Re-rank a candidate list using a cross-encoder.
+    """Score (query, candidate.text) pairs using a Cross-Encoder.
 
-    `candidates` is a list of {"doc_id": str, "text": str} (or a similar
-    schema providing the text to score). Score each (query, candidate.text)
-    pair; sort descending; return the top-`k_out` doc_id strings.
+    Args:
+        query: The user's search query.
+        candidates: List of dicts, each containing at minimum 'doc_id' and 'text'.
+        k_out: Number of top candidates to return after re-ranking.
 
-    Hint:
-        from sentence_transformers import CrossEncoder
-        ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-        pairs = [(query, c["text"]) for c in candidates]
-        scores = ce.predict(pairs)
-        # argsort descending, take top k_out, map back to doc_id
+    Returns:
+        list[str]: The top-k_out doc_id strings, ordered by Cross-Encoder score descending.
     """
-    # TODO: load CrossEncoder (consider module-level for speed)
-    # TODO: build pairs, score with ce.predict, argsort descending, take top k_out
-    # TODO: return list of doc_id strings
-    raise NotImplementedError("cross_encoder_rerank is not yet implemented")
+    if not candidates:
+        return []
+
+    # Build (query, text) pairs for the Cross-Encoder
+    # We use candidate["text"] as the content to compare against the query
+    pairs = [[query, c["text"]] for c in candidates]
+
+    # Predict scores for all pairs
+    # Cross-encoders process the query and document jointly for higher accuracy
+    scores = _CE_MODEL.predict(pairs)
+
+    # Sort candidates by score descending and return top k_out doc_ids
+    # Zip scores with doc_ids to maintain the mapping during sort
+    scored_results = sorted(
+        zip(scores, [c["doc_id"] for c in candidates]),
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+    return [res[1] for res in scored_results[:k_out]]
 
 
 def rerank_search(
@@ -42,17 +53,36 @@ def rerank_search(
     query: str,
     embedder,
     k_in: int = 50,
-    k_out: int = 5,
+    k_out: int = 5
 ) -> list[str]:
-    """Two-stage retriever: hybrid retrieve k_in, cross-encoder re-rank to k_out.
+    """Two-stage search: Hybrid candidate generation followed by re-ranking.
 
-    Stage 1: hybrid_search(client, query, k_in, embedder, alpha=0.5) -> list[doc_id]
-    Stage 2: resolve each doc_id back to its text from Weaviate
-    Stage 3: cross_encoder_rerank(query, candidates, k_out)
+    Args:
+        client: Weaviate client.
+        query: Search query string.
+        embedder: The dense embedder (Bi-Encoder) used for the first stage.
+        k_in: Number of candidates to retrieve in the first stage (default 50).
+        k_out: Number of candidates to return after re-ranking (default 5).
 
-    Return the ordered list of doc_id strings, length <= k_out.
+    Returns:
+        list[str]: The final top-k_out doc_ids.
     """
-    # TODO: stage 1: hybrid_search to get k_in candidate doc_ids
-    # TODO: resolve each doc_id back to {"doc_id": ..., "text": ...} via Weaviate query
-    # TODO: stage 3: cross_encoder_rerank(query, candidates, k_out)
-    raise NotImplementedError("rerank_search is not yet implemented")
+    # Stage 1 — Hybrid retrieve k_in candidates.
+    # We need both 'doc_id' for identification and 'text' for the Cross-Encoder stage.
+    qv = embedder.encode(query).tolist()
+    
+    response = (
+        client.query.get("Post", ["doc_id", "text"])
+        .with_hybrid(query=query, vector=qv, alpha=0.5)
+        .with_limit(k_in)
+        .do()
+    )
+
+    # Extracting results safely from Weaviate response
+    if "data" not in response or not response["data"]["Get"]["Post"]:
+        return []
+    
+    candidates = response["data"]["Get"]["Post"]
+
+    # Stage 2 — Cross-encoder re-rank to k_out.
+    return cross_encoder_rerank(query, candidates, k_out)
